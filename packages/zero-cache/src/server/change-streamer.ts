@@ -67,6 +67,7 @@ export default async function runWorker(
       flowControlConsensusPaddingSeconds,
       flowControlEventDrivenRelease,
       sqliteChangeLogMode,
+      sqliteChangeLogComparePercent,
       sqliteChangeLogRetentionMs,
       sqliteChangeLogReadBatchRows,
       sqliteChangeLogPurgeBatchRows,
@@ -235,11 +236,18 @@ export default async function runWorker(
                 batchRows: sqliteChangeLogPurgeBatchRows,
               }
             : undefined,
-          // `compare` and above. The replica-derived initialization path runs
-          // at full rate and is checked against Postgres, which stays
-          // authoritative. Flipping authority to the replica comes later.
+          // `compare` and above, gating both dark checks: the replica-derived
+          // initialization path runs at full rate and is checked against
+          // Postgres's, and the comparator samples both stores' catchup
+          // output. Postgres stays authoritative; nothing a subscriber is
+          // served changes. Flipping authority to the replica comes later.
           sqliteChangeLogCompare: sqliteChangeLogComparing
-            ? {replicaFile: replica.file}
+            ? {
+                replicaFile: replica.file,
+                comparePercent: sqliteChangeLogComparePercent,
+                retentionMs: sqliteChangeLogRetentionMs,
+                readBatchRows: sqliteChangeLogReadBatchRows,
+              }
             : undefined,
         },
         setTimeout,
