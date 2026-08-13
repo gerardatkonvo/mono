@@ -97,6 +97,7 @@ export class Connection {
   readonly #lc: LogContext;
   readonly #onClose: () => void;
   readonly #messageHandler: MessageHandler;
+  readonly #downstreamSender: DownstreamSender;
   readonly #downstreamMsgTimer: NodeJS.Timeout | undefined;
   readonly #webSocketErrors = getOrCreateCounter(
     'sync',
@@ -106,7 +107,6 @@ export class Connection {
 
   #viewSyncerOutboundStream: Source<ViewSyncerDownstream> | undefined;
   #pusherOutboundStream: Source<Downstream> | undefined;
-  #pokeChunkEncoder: PokeChunkEncoder | undefined;
   #closed = false;
 
   constructor(
@@ -128,6 +128,11 @@ export class Connection {
       .withContext('clientID', clientID)
       .withContext('clientGroupID', clientGroupID)
       .withContext('wsID', wsID);
+    this.#downstreamSender = new DownstreamSender(
+      this.#lc,
+      ws,
+      protocolVersion,
+    );
     this.#lc.debug?.('new connection');
     this.#onClose = onClose;
 
@@ -373,6 +378,74 @@ export class Connection {
     serialized?: string | undefined,
   ) {
     this.#lastDownstreamMsgTime = Date.now();
+    this.#downstreamSender.send(data, callback, serialized);
+  }
+
+  sendError(errorBody: ErrorBody, thrown?: unknown) {
+    sendError(this.#lc, this.#ws, errorBody, thrown);
+  }
+}
+
+export type WebSocketLike = Pick<WebSocket, 'readyState'> & {
+  send(data: string | PokeChunk, cb?: (err?: Error) => void): void;
+};
+
+// Exported for testing purposes.
+export function send(
+  lc: LogContext,
+  ws: WebSocketLike,
+  data: Downstream,
+  callback: ((err?: Error | null) => void) | 'ignore-backpressure',
+  serialized?: string | undefined,
+) {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(
+      serialized ?? JSON.stringify(data),
+      callback === 'ignore-backpressure' ? undefined : callback,
+    );
+  } else {
+    lc.debug?.(`Dropping outbound message on ws (state: ${ws.readyState})`, {
+      dropped: data,
+    });
+    if (callback !== 'ignore-backpressure') {
+      callback(
+        new ProtocolErrorWithLevel(
+          {
+            kind: ErrorKind.Internal,
+            message: 'WebSocket closed',
+            origin: ErrorOrigin.ZeroCache,
+          },
+          'info',
+        ),
+      );
+    }
+  }
+}
+
+/**
+ * Sends downstream messages in the format supported by a connection's sync
+ * protocol version. Keep version forks contained here so the view-syncer can
+ * continue producing one canonical poke representation.
+ *
+ * Exported for compatibility testing.
+ */
+export class DownstreamSender {
+  readonly #lc: LogContext;
+  readonly #ws: WebSocketLike;
+  readonly #protocolVersion: number;
+  #pokeChunkEncoder: PokeChunkEncoder | undefined;
+
+  constructor(lc: LogContext, ws: WebSocketLike, protocolVersion: number) {
+    this.#lc = lc;
+    this.#ws = ws;
+    this.#protocolVersion = protocolVersion;
+  }
+
+  send(
+    data: Downstream,
+    callback: ((err?: Error | null) => void) | 'ignore-backpressure',
+    serialized?: string | undefined,
+  ): void {
     if (this.#protocolVersion >= POKE_CHUNK_PROTOCOL_VERSION) {
       switch (data[0]) {
         case 'pokeStart':
@@ -390,7 +463,7 @@ export class Connection {
           return;
       }
     }
-    return send(this.#lc, this.#ws, data, callback, serialized);
+    send(this.#lc, this.#ws, data, callback, serialized);
   }
 
   #sendPokePart(
@@ -432,46 +505,6 @@ export class Connection {
         () => invokeCallback(callback),
         error => invokeCallback(callback, toError(error)),
       );
-  }
-
-  sendError(errorBody: ErrorBody, thrown?: unknown) {
-    sendError(this.#lc, this.#ws, errorBody, thrown);
-  }
-}
-
-export type WebSocketLike = Pick<WebSocket, 'readyState'> & {
-  send(data: string | PokeChunk, cb?: (err?: Error) => void): void;
-};
-
-// Exported for testing purposes.
-export function send(
-  lc: LogContext,
-  ws: WebSocketLike,
-  data: Downstream,
-  callback: ((err?: Error | null) => void) | 'ignore-backpressure',
-  serialized?: string | undefined,
-) {
-  if (ws.readyState === WebSocket.OPEN) {
-    ws.send(
-      serialized ?? JSON.stringify(data),
-      callback === 'ignore-backpressure' ? undefined : callback,
-    );
-  } else {
-    lc.debug?.(`Dropping outbound message on ws (state: ${ws.readyState})`, {
-      dropped: data,
-    });
-    if (callback !== 'ignore-backpressure') {
-      callback(
-        new ProtocolErrorWithLevel(
-          {
-            kind: ErrorKind.Internal,
-            message: 'WebSocket closed',
-            origin: ErrorOrigin.ZeroCache,
-          },
-          'info',
-        ),
-      );
-    }
   }
 }
 
